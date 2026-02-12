@@ -3,6 +3,7 @@ import { createCerebras } from "@ai-sdk/cerebras";
 import { z } from "zod";
 import { getBytecode, getErc20Metadata } from "@/lib/chains/evm/base-rpc";
 import { getBaseContractVerification } from "@/lib/chains/evm/basescan";
+import { getTopHoldersFromBitquery } from "@/lib/chains/evm/bitquery-holders";
 import { getDexPairsForBaseToken } from "@/lib/chains/evm/dexscreener";
 
 const riskLevelSchema = z.enum(["low", "medium", "high", "critical"]);
@@ -36,6 +37,7 @@ const plannerStepSchema = z.object({
     "rpc_getErc20Metadata",
     "basescan_getSourceInfo",
     "dexscreener_getPairs",
+    "holders_getTopHolders",
   ]),
   reason: z.string(),
 });
@@ -81,6 +83,10 @@ const TOOL_METADATA: Record<ToolName, { stepKey: string; title: string }> = {
     stepKey: "dex_market",
     title: "Fetch DEX market data",
   },
+  holders_getTopHolders: {
+    stepKey: "holders_distribution",
+    title: "Fetch holder distribution",
+  },
 };
 
 const REQUIRED_TOOLS: ToolName[] = ["rpc_getBytecode", "rpc_getErc20Metadata", "dexscreener_getPairs"];
@@ -114,6 +120,7 @@ function normalizePlannerSteps(rawSteps: z.infer<typeof plannerStepSchema>[]) {
     "rpc_getBytecode",
     "rpc_getErc20Metadata",
     "dexscreener_getPairs",
+    ...(process.env.BITQUERY_ACCESS_TOKEN ? (["holders_getTopHolders"] as ToolName[]) : []),
     ...(process.env.ETHERSCAN_API_KEY || process.env.BASESCAN_API_KEY
       ? (["basescan_getSourceInfo"] as ToolName[])
       : []),
@@ -135,6 +142,10 @@ function normalizePlannerSteps(rawSteps: z.infer<typeof plannerStepSchema>[]) {
     if (!deduped.includes(requiredTool)) {
       deduped.unshift(requiredTool);
     }
+  }
+
+  if (process.env.BITQUERY_ACCESS_TOKEN && !deduped.includes("holders_getTopHolders")) {
+    deduped.push("holders_getTopHolders");
   }
 
   const finalTools: ToolName[] = [];
@@ -183,10 +194,29 @@ function assertReasonCitations(
   }
 }
 
+function hydrateMissingEvidenceRefs(
+  reasons: z.infer<typeof assessmentSchema>["reasons"],
+  evidenceItems: EvidenceItem[],
+) {
+  const allEvidenceIds = evidenceItems.map((item) => item.id);
+
+  return reasons.map((reason) => {
+    if (reason.evidenceRefs.length > 0) {
+      return reason;
+    }
+
+    return {
+      ...reason,
+      evidenceRefs: allEvidenceIds,
+    };
+  });
+}
+
 export async function planBaseScan(tokenAddress: string) {
   const cerebras = getProvider();
   const modelId = getModelId();
   const hasBaseScan = Boolean(process.env.ETHERSCAN_API_KEY || process.env.BASESCAN_API_KEY);
+  const hasHolders = Boolean(process.env.BITQUERY_ACCESS_TOKEN);
 
   const runPlan = async (candidateModel: string) =>
     generateText({
@@ -194,7 +224,7 @@ export async function planBaseScan(tokenAddress: string) {
       temperature: 0,
       system:
         "You are Drona planner. Produce a concise investigation tool plan for a Base token risk scan. Use only allowed tools. No explanations outside JSON.",
-      prompt: `Token address: ${tokenAddress}\nAllowed tools: rpc_getBytecode, rpc_getErc20Metadata, dexscreener_getPairs${hasBaseScan ? ", basescan_getSourceInfo" : ""}.\nBaseScan tool availability: ${hasBaseScan ? "available" : "unavailable"}.\nReturn ordered steps from most essential to optional.`,
+      prompt: `Token address: ${tokenAddress}\nAllowed tools: rpc_getBytecode, rpc_getErc20Metadata, dexscreener_getPairs${hasBaseScan ? ", basescan_getSourceInfo" : ""}${hasHolders ? ", holders_getTopHolders" : ""}.\nBaseScan tool availability: ${hasBaseScan ? "available" : "unavailable"}.\nHolders tool availability: ${hasHolders ? "available" : "unavailable"}.\nReturn ordered steps from most essential to optional.`,
       output: Output.object({
         schema: plannerSchema,
         name: "drona_plan",
@@ -230,7 +260,40 @@ export async function planBaseScan(tokenAddress: string) {
   };
 }
 
-export async function runEvidenceTool(toolName: ToolName, tokenAddress: string): Promise<EvidenceItem> {
+function parseNumericString(input: string) {
+  const value = Number(input);
+  return Number.isFinite(value) ? value : null;
+}
+
+function inferHolderTokens(amount: string, decimals: number | null) {
+  const parsed = parseNumericString(amount);
+  if (parsed === null) {
+    return null;
+  }
+
+  if (amount.includes(".")) {
+    return parsed;
+  }
+
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  if (typeof decimals === "number" && decimals >= 0) {
+    const divided = parsed / 10 ** Math.min(decimals, 18);
+    if (divided > 0 && divided < parsed) {
+      return divided;
+    }
+  }
+
+  return parsed;
+}
+
+export async function runEvidenceTool(
+  toolName: ToolName,
+  tokenAddress: string,
+  context?: { evidenceItems?: EvidenceItem[] },
+): Promise<EvidenceItem> {
   const address = tokenAddress.toLowerCase();
 
   try {
@@ -286,6 +349,113 @@ export async function runEvidenceTool(toolName: ToolName, tokenAddress: string):
           isVerified: result.isVerified,
         },
         error: result.error,
+      };
+    }
+
+    if (toolName === "holders_getTopHolders") {
+      const holdersResult = await getTopHoldersFromBitquery(address, 10);
+      const metadataEvidence = (context?.evidenceItems ?? []).find((item) => item.tool === "rpc_getErc20Metadata");
+      const decimalsRaw = metadataEvidence?.data.decimals;
+      const totalSupplyRaw = metadataEvidence?.data.totalSupply;
+      const decimals = typeof decimalsRaw === "number" ? decimalsRaw : null;
+      const totalSupplyTokens =
+        typeof totalSupplyRaw === "string" && decimals !== null
+          ? parseNumericString(totalSupplyRaw) !== null
+            ? (parseNumericString(totalSupplyRaw) as number) / 10 ** Math.min(decimals, 18)
+            : null
+          : null;
+
+      const topFive = holdersResult.holders.slice(0, 5);
+      const topTen = holdersResult.holders.slice(0, 10);
+
+      const withContracts = await Promise.all(
+        topFive.map(async (holder) => {
+          try {
+            const code = await getBytecode(holder.address);
+            return {
+              ...holder,
+              isContract: code !== "0x",
+            };
+          } catch {
+            return {
+              ...holder,
+              isContract: null,
+            };
+          }
+        }),
+      );
+
+      const canComputeSupplyPct = holdersResult.method === "token_holders";
+      const amountValues = withContracts.map((holder) => parseNumericString(holder.amount) ?? 0);
+      const amountTotal = amountValues.reduce((sum, value) => sum + value, 0);
+
+      const mappedTopFive = withContracts.map((holder) => {
+        const amountTokens = inferHolderTokens(holder.amount, decimals);
+        const pctOfSupply =
+          canComputeSupplyPct && amountTokens !== null && totalSupplyTokens !== null && totalSupplyTokens > 0
+            ? Number(((amountTokens / totalSupplyTokens) * 100).toFixed(4))
+            : null;
+        const amountValue = parseNumericString(holder.amount);
+        const relativeSharePct =
+          amountValue !== null && amountTotal > 0 ? Number(((amountValue / amountTotal) * 100).toFixed(4)) : null;
+
+        return {
+          address: holder.address,
+          amount: holder.amount,
+          amountTokens,
+          pctOfSupply,
+          relativeSharePct,
+          isContract: holder.isContract,
+        };
+      });
+
+      const mappedTopTen = topTen.map((holder) => {
+        const amountTokens = inferHolderTokens(holder.amount, decimals);
+        const pctOfSupply =
+          canComputeSupplyPct && amountTokens !== null && totalSupplyTokens !== null && totalSupplyTokens > 0
+            ? Number(((amountTokens / totalSupplyTokens) * 100).toFixed(4))
+            : null;
+
+        return {
+          address: holder.address,
+          amount: holder.amount,
+          amountTokens,
+          pctOfSupply,
+        };
+      });
+
+      const hasSupplyPct = mappedTopFive.some((holder) => holder.pctOfSupply !== null);
+      const top5Pct = hasSupplyPct
+        ? mappedTopFive.reduce((sum, holder) => sum + (holder.pctOfSupply ?? 0), 0)
+        : null;
+      const top10Pct = hasSupplyPct
+        ? mappedTopTen.reduce((sum, holder) => sum + (holder.pctOfSupply ?? 0), 0)
+        : null;
+
+      return {
+        id: buildEvidenceId("ev_holders"),
+        tool: toolName,
+        title: "Bitquery holder distribution",
+        sourceUrl: holdersResult.sourceUrl,
+        fetchedAt: toTimestamp(),
+        status: "ok",
+        data: {
+          tokenAddress: address,
+          asOfDate: holdersResult.asOfDate,
+          attemptedDates: holdersResult.attemptedDates,
+          method: holdersResult.method,
+          topHolders: mappedTopFive,
+          top10: mappedTopTen,
+          top5Pct,
+          top10Pct,
+          decimals,
+          totalSupplyTokens,
+          notes:
+            holdersResult.method === "balance_updates"
+              ? "Holder ranking approximated from BalanceUpdates (USD-based)."
+              : undefined,
+        },
+        error: null,
       };
     }
 
@@ -387,6 +557,7 @@ export async function assessBaseScan(tokenAddress: string, evidenceItems: Eviden
   }
 
   const assessment = assessmentSchema.parse(result.output);
+  assessment.reasons = hydrateMissingEvidenceRefs(assessment.reasons, evidenceItems);
 
   if (assessment.summary.trim().length === 0) {
     throw new Error("Assessment summary is empty");

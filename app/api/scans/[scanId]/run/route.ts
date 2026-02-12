@@ -22,6 +22,16 @@ function buildFallbackPlan(): PlannedStep[] {
       title: "Read token metadata",
       reason: "Collect token metadata for context",
     },
+    ...(process.env.BITQUERY_ACCESS_TOKEN
+      ? [
+          {
+            stepKey: "holders_distribution",
+            toolName: "holders_getTopHolders",
+            title: "Fetch holder distribution",
+            reason: "Collect top holder concentration metrics",
+          } satisfies PlannedStep,
+        ]
+      : []),
     {
       stepKey: "dex_market",
       toolName: "dexscreener_getPairs",
@@ -243,7 +253,9 @@ export async function POST(
         payload: { toolName: step.toolName, reason: step.reason },
       });
 
-      const evidenceItem = await runEvidenceTool(step.toolName, claimed.tokenAddress);
+      const evidenceItem = await runEvidenceTool(step.toolName, claimed.tokenAddress, {
+        evidenceItems,
+      });
       evidenceItems.push(evidenceItem);
 
       await appendScanEvent({
