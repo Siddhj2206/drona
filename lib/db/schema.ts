@@ -1,4 +1,4 @@
-import { index, integer, jsonb, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { bigserial, index, integer, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 
 export const scans = pgTable(
   "scans",
@@ -23,5 +23,29 @@ export const scans = pgTable(
   ],
 );
 
+export const scanEvents = pgTable(
+  "scan_events",
+  {
+    id: bigserial("id", { mode: "number" }).primaryKey(),
+    scanId: uuid("scan_id")
+      .notNull()
+      .references(() => scans.id, { onDelete: "cascade" }),
+    seq: integer("seq").notNull(),
+    ts: timestamp("ts", { withTimezone: true }).notNull().defaultNow(),
+    level: text("level").notNull(),
+    type: text("type").notNull(),
+    stepKey: text("step_key"),
+    message: text("message").notNull(),
+    payload: jsonb("payload").$type<Record<string, unknown> | null>(),
+  },
+  (table) => [
+    uniqueIndex("scan_events_scan_seq_uidx").on(table.scanId, table.seq),
+    index("scan_events_scan_id_idx").on(table.scanId, table.id),
+    index("scan_events_scan_ts_idx").on(table.scanId, table.ts),
+  ],
+);
+
 export type Scan = typeof scans.$inferSelect;
 export type NewScan = typeof scans.$inferInsert;
+export type ScanEvent = typeof scanEvents.$inferSelect;
+export type NewScanEvent = typeof scanEvents.$inferInsert;
