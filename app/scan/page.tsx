@@ -2,9 +2,10 @@
 
 import { FormEvent, useState } from "react";
 import { useRouter } from "next/navigation";
+import { Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { HudHeader } from "@/components/scan/hud-header";
 
 const tokenAddressRegex = /^0x[a-fA-F0-9]{40}$/;
 
@@ -40,9 +41,7 @@ export default function ScanPage() {
       }
 
       if (!preflightData.hasCode) {
-        setError(
-          "This address has no contract code on Base. Use a Base token contract address, not a wallet address.",
-        );
+        setError("No contract bytecode found on Base. Use a Base token contract address.");
         setIsSubmitting(false);
         return;
       }
@@ -57,7 +56,6 @@ export default function ScanPage() {
 
       const data = (await response.json()) as {
         scanId?: string;
-        status?: "queued" | "complete" | "failed";
         error?: string;
       };
 
@@ -66,8 +64,9 @@ export default function ScanPage() {
       }
 
       router.push(`/scan/${data.scanId}`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Unable to create scan right now. Please try again.";
+    } catch (caughtError) {
+      const message =
+        caughtError instanceof Error ? caughtError.message : "Unable to create scan right now. Please try again.";
       setError(message);
     } finally {
       setIsSubmitting(false);
@@ -75,42 +74,53 @@ export default function ScanPage() {
   };
 
   return (
-    <main className="mx-auto flex min-h-[calc(100vh-5rem)] w-full max-w-3xl items-center px-6 py-10">
-      <Card className="w-full">
-        <CardHeader>
-          <CardTitle>Start a token scan</CardTitle>
-          <CardDescription>
-            Enter a Base token contract address to generate a shareable risk report.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form className="space-y-4" onSubmit={handleSubmit}>
-            <Input
-              placeholder="0x..."
-              value={tokenAddress}
-              onChange={(event) => setTokenAddress(event.target.value)}
-              disabled={isSubmitting}
-              autoComplete="off"
-              spellCheck={false}
-            />
+    <main className="h-screen w-screen relative">
+      <HudHeader />
 
-            {error ? <p className="text-sm text-destructive">{error}</p> : null}
+      <div className="flex h-full items-center justify-center px-6 pt-16 pb-6">
+        <div className="relative flex w-full max-w-4xl flex-col items-center justify-center animate-fade-in">
+          <div className="absolute h-[600px] w-[600px] rounded-full border border-[#00f3ff]/20 dashed-circle animate-spin-slow opacity-40" />
+          <div className="absolute h-[400px] w-[400px] rotate-45 border border-[#00f3ff]/30 opacity-40" />
+          <div className="absolute h-px w-[500px] bg-[#00f3ff]/20 opacity-40" />
+          <div className="absolute h-[500px] w-px bg-[#00f3ff]/20 opacity-40" />
 
-            <Button type="submit" disabled={isSubmitting}>
-              {isSubmitting ? "Creating scan..." : "Scan token"}
-            </Button>
+          <h1 className="mb-4 text-center text-5xl font-bold tracking-tight text-white text-glow md:text-7xl">
+            INPUT_TARGET
+          </h1>
+          <p className="mb-10 font-mono text-xs uppercase tracking-[0.22em] text-[#00f3ff]/70">
+            Base token contract only
+          </p>
 
-            <Button
-              type="button"
-              variant="outline"
-              disabled={isSubmitting}
-              onClick={() => setTokenAddress("0xf43eb8de897fbc7f2502483b2bef7bb9ea179229")}
-            >
-              Use sample Base token
-            </Button>
+          <form className="group relative w-full max-w-3xl" onSubmit={handleSubmit}>
+            <div className="absolute -inset-0.5 rounded bg-[#00f3ff] opacity-20 blur-sm transition-opacity duration-500 group-hover:opacity-40" />
+
+            <div className="clip-corner-tr relative flex items-center border border-[#00f3ff] bg-[#030014]/90 p-1">
+              <div className="p-4 text-[#00f3ff]/50 animate-pulse">
+                <Search className="h-5 w-5" />
+              </div>
+              <Input
+                placeholder="0x..."
+                value={tokenAddress}
+                onChange={(event) => setTokenAddress(event.target.value)}
+                disabled={isSubmitting}
+                autoComplete="off"
+                spellCheck={false}
+                className="h-14 flex-1 rounded-none border-0 bg-transparent px-4 py-4 font-mono text-xl uppercase tracking-wider text-white shadow-none placeholder:text-gray-600 focus-visible:ring-0"
+              />
+              <Button
+                type="submit"
+                disabled={isSubmitting}
+                className="h-14 rounded-none border-l border-[#00f3ff]/50 bg-[#00f3ff]/20 px-8 font-mono text-sm uppercase tracking-widest text-[#00f3ff] hover:bg-[#00f3ff] hover:text-black"
+              >
+                {isSubmitting ? "SCANNING" : "SCAN"}
+              </Button>
+            </div>
+
+            {error ? <p className="mt-3 text-sm text-[#ff0055]">{error}</p> : null}
           </form>
-        </CardContent>
-      </Card>
+
+        </div>
+      </div>
     </main>
   );
 }
