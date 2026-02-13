@@ -269,6 +269,66 @@ function hydrateMissingEvidenceRefs(
   });
 }
 
+function isNoOutputError(error: unknown) {
+  return error instanceof Error && error.message.toLowerCase().includes("no output generated");
+}
+
+function truncateText(input: string, maxLength: number) {
+  if (input.length <= maxLength) {
+    return input;
+  }
+  return `${input.slice(0, Math.max(0, maxLength - 1))}...`;
+}
+
+function compactUnknown(value: unknown, depth = 0): unknown {
+  if (value === null || typeof value === "boolean" || typeof value === "number") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    return truncateText(value, 220);
+  }
+
+  if (Array.isArray(value)) {
+    if (depth >= 2) {
+      return `array(${value.length})`;
+    }
+    return value.slice(0, 5).map((entry) => compactUnknown(entry, depth + 1));
+  }
+
+  if (typeof value === "object") {
+    if (depth >= 2) {
+      return "object";
+    }
+    const entries = Object.entries(value as Record<string, unknown>).slice(0, 16);
+    return Object.fromEntries(entries.map(([key, entry]) => [key, compactUnknown(entry, depth + 1)]));
+  }
+
+  return String(value);
+}
+
+function buildAssessmentEvidenceVariants(evidenceItems: EvidenceItem[]) {
+  const full = evidenceItems.map((item) => ({
+    id: item.id,
+    tool: item.tool,
+    title: item.title,
+    status: item.status,
+    error: item.error,
+    data: item.data,
+  }));
+
+  const compact = evidenceItems.map((item) => ({
+    id: item.id,
+    tool: item.tool,
+    title: item.title,
+    status: item.status,
+    error: item.error ? truncateText(item.error, 180) : null,
+    data: compactUnknown(item.data),
+  }));
+
+  return [full, compact];
+}
+
 export async function planBaseScan(tokenAddress: string) {
   const cerebras = getProvider();
   const modelId = getModelId();
@@ -805,22 +865,16 @@ export async function assessBaseScan(tokenAddress: string, evidenceItems: Eviden
   const cerebras = getProvider();
   const modelId = getModelId();
 
-  const condensedEvidence = evidenceItems.map((item) => ({
-    id: item.id,
-    tool: item.tool,
-    title: item.title,
-    status: item.status,
-    error: item.error,
-    data: item.data,
-  }));
-
-  const runAssessment = async (candidateModel: string) =>
+  const runAssessment = async (
+    candidateModel: string,
+    evidencePayload: ReturnType<typeof buildAssessmentEvidenceVariants>[number],
+  ) =>
     generateText({
       model: cerebras(candidateModel),
       temperature: 0,
       system:
         "You are Drona assessor. Return a strict risk assessment JSON from evidence only. Never invent facts. If data is missing, set lower confidence and list missingData.",
-      prompt: `Token address: ${tokenAddress}\nEvidence JSON:\n${JSON.stringify(condensedEvidence)}\n\nEvery reason must include evidenceRefs using ids from evidence JSON.`,
+      prompt: `Token address: ${tokenAddress}\nEvidence JSON:\n${JSON.stringify(evidencePayload)}\n\nEvery reason must include evidenceRefs using ids from evidence JSON.`,
       output: Output.object({
         schema: assessmentSchema,
         name: "drona_assessment",
@@ -834,32 +888,43 @@ export async function assessBaseScan(tokenAddress: string, evidenceItems: Eviden
       maxOutputTokens: 1400,
     });
 
-  let result;
-  try {
-    result = await runAssessment(modelId);
-  } catch (error) {
-    const shouldRetry = modelId !== FALLBACK_MODEL_ID && error instanceof Error && error.message.includes("No output generated");
+  const candidateModels = modelId === FALLBACK_MODEL_ID ? [modelId] : [modelId, FALLBACK_MODEL_ID];
+  const evidenceVariants = buildAssessmentEvidenceVariants(evidenceItems);
 
-    if (!shouldRetry) {
-      throw error;
+  let lastError: unknown = null;
+
+  for (const candidateModel of candidateModels) {
+    for (let variantIndex = 0; variantIndex < evidenceVariants.length; variantIndex += 1) {
+      try {
+        const result = await runAssessment(candidateModel, evidenceVariants[variantIndex]);
+        const assessment = assessmentSchema.parse(result.output);
+        assessment.reasons = hydrateMissingEvidenceRefs(assessment.reasons, evidenceItems);
+
+        if (assessment.summary.trim().length === 0) {
+          throw new Error("Assessment summary is empty");
+        }
+
+        assertReasonCitations(assessment.reasons, evidenceItems);
+
+        return {
+          assessment,
+          model: result.response.modelId ?? candidateModel,
+        };
+      } catch (error) {
+        lastError = error;
+        const hasMoreVariants = variantIndex < evidenceVariants.length - 1;
+        if (hasMoreVariants && isNoOutputError(error)) {
+          continue;
+        }
+
+        if (!hasMoreVariants) {
+          break;
+        }
+      }
     }
-
-    result = await runAssessment(FALLBACK_MODEL_ID);
   }
 
-  const assessment = assessmentSchema.parse(result.output);
-  assessment.reasons = hydrateMissingEvidenceRefs(assessment.reasons, evidenceItems);
-
-  if (assessment.summary.trim().length === 0) {
-    throw new Error("Assessment summary is empty");
-  }
-
-  assertReasonCitations(assessment.reasons, evidenceItems);
-
-  return {
-    assessment,
-    model: result.response.modelId ?? modelId,
-  };
+  throw lastError instanceof Error ? lastError : new Error("Assessment generation failed");
 }
 
 export { assessmentSchema };

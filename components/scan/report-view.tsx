@@ -731,9 +731,18 @@ export function ReportView({ scanId, tokenAddress, status, createdAtIso, narrati
               : "opacity-20 pointer-events-none"
           }`}
         >
-          <div className="absolute inset-0 opacity-20 bg-[linear-gradient(rgba(0,243,255,0.1)_1px,transparent_1px),linear-gradient(90deg,rgba(0,243,255,0.1)_1px,transparent_1px)] bg-[length:20px_20px]" />
-          <div className="absolute inset-0">
-            <AddressGraph data={addressGraphData} className="h-full w-full" />
+          <div className="absolute inset-0 border-y border-[#00f3ff]/10 bg-[#00f3ff]/5" />
+          <p className="absolute top-4 right-4 font-mono text-xs text-[#00f3ff]/60 animate-pulse">LIVE_FEED::GRAPH_VISUALIZER</p>
+
+          <div className="absolute inset-4 overflow-hidden rounded-lg border border-[#00f3ff]/20 bg-[#030014]/40">
+            <div className="absolute inset-0 opacity-20 bg-[linear-gradient(rgba(0,243,255,0.1)_1px,transparent_1px),linear-gradient(90deg,rgba(0,243,255,0.1)_1px,transparent_1px)] bg-[length:20px_20px]" />
+
+            <div className="relative h-full w-full">
+              <AddressGraph data={addressGraphData} className="h-full w-full" />
+              <div className="pointer-events-none absolute top-4 left-4 rounded border border-[#00f3ff]/25 bg-[#030014]/80 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.14em] text-[#00f3ff]/75">
+                report :: {addressGraphData.nodes.length} nodes / {addressGraphData.links.length} links
+              </div>
+            </div>
           </div>
         </div>
 

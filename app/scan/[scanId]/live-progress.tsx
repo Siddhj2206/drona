@@ -191,7 +191,7 @@ export function LiveProgress({ scanId, tokenAddress, initialStatus }: LiveProgre
 
       <div className="flex h-full items-center justify-center px-6 pt-16 pb-6">
         <div className="flex h-full w-full gap-4">
-          <div className="relative h-full w-1/3 overflow-hidden border-r border-[#00f3ff]/20 bg-[#030014]/80 backdrop-blur-md">
+          <div className="relative h-full w-1/4 overflow-hidden border-r border-[#00f3ff]/20 bg-[#030014]/80 backdrop-blur-md">
             <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-transparent via-[#00f3ff] to-transparent opacity-50" />
 
             <div className="flex h-full flex-col p-6 text-xs font-mono">
@@ -215,7 +215,7 @@ export function LiveProgress({ scanId, tokenAddress, initialStatus }: LiveProgre
             </div>
           </div>
 
-          <div className="relative h-full w-2/3">
+          <div className="relative h-full w-3/4">
             <div className="absolute inset-0 border-y border-[#00f3ff]/10 bg-[#00f3ff]/5" />
             <p className="absolute top-4 right-4 font-mono text-xs text-[#00f3ff]/60 animate-pulse">
               LIVE_FEED::GRAPH_VISUALIZER

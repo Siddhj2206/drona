@@ -19,6 +19,7 @@ export type AddressGraphLink = {
   source: string;
   target: string;
   label: string;
+  kind: "deployed" | "ownership" | "implementation" | "liquidity" | "holding";
   weight: number;
   approximate?: boolean;
 };
@@ -82,19 +83,29 @@ export function buildAddressGraphData(tokenAddress: string, evidenceItems: Graph
     }
   };
 
-  const addLink = (sourceAddress: string, targetAddress: string, label: string, weight = 1, approximate = false) => {
+  const addLink = (
+    sourceAddress: string,
+    targetAddress: string,
+    label: string,
+    kind: AddressGraphLink["kind"],
+    weight = 1,
+    approximate = false,
+  ) => {
     const source = normalizeAddress(sourceAddress);
     const target = normalizeAddress(targetAddress);
-    const key = `${source}|${target}|${label}`;
+    const key = `${source}|${target}|${kind}`;
     const current = links.get(key);
 
     if (!current) {
-      links.set(key, { source, target, label, weight, approximate });
+      links.set(key, { source, target, label, kind, weight, approximate });
       return;
     }
 
     if (weight > current.weight) {
       current.weight = weight;
+    }
+    if (label.length > current.label.length) {
+      current.label = label;
     }
     current.approximate = current.approximate || approximate;
   };
@@ -107,7 +118,7 @@ export function buildAddressGraphData(tokenAddress: string, evidenceItems: Graph
   const deployerAddress = creation?.data?.deployerAddress;
   if (isAddress(deployerAddress) && isAddress(tokenAddress)) {
     addNode(deployerAddress, "deployer", 1.2, "Contract deployer");
-    addLink(deployerAddress, tokenAddress, "DEPLOYED", 1.4);
+    addLink(deployerAddress, tokenAddress, "DEPLOYED", "deployed", 1.4);
   }
 
   const ownerStatus = getItem(evidenceItems, "contract_ownerStatus");
@@ -115,14 +126,14 @@ export function buildAddressGraphData(tokenAddress: string, evidenceItems: Graph
   if (isAddress(ownerAddress) && isAddress(tokenAddress)) {
     const renounced = ownerStatus?.data?.renounced === true;
     addNode(ownerAddress, "owner", 1.2, renounced ? "Owner (renounced signal)" : "Owner");
-    addLink(ownerAddress, tokenAddress, "OWNS", 1.3);
+    addLink(ownerAddress, tokenAddress, "OWNS", "ownership", 1.3);
   }
 
   const sourceInfo = getItem(evidenceItems, "basescan_getSourceInfo");
   const implementationAddress = sourceInfo?.data?.implementationAddress;
   if (isAddress(implementationAddress) && isAddress(tokenAddress)) {
     addNode(implementationAddress, "implementation", 1.1, "Proxy implementation");
-    addLink(implementationAddress, tokenAddress, "IMPLEMENTS", 1.1);
+    addLink(implementationAddress, tokenAddress, "IMPLEMENTS", "implementation", 1.1);
   }
 
   const dex = getItem(evidenceItems, "dexscreener_getPairs");
@@ -145,7 +156,7 @@ export function buildAddressGraphData(tokenAddress: string, evidenceItems: Graph
     addNode(pair.pairAddress, "pair", 1.1, pair.dex ? `DEX pair (${pair.dex})` : "DEX pair");
     if (isAddress(tokenAddress)) {
       const linkWeight = pair.liquidityUsd !== null ? Math.min(2, 1 + pair.liquidityUsd / 1_000_000) : 1;
-      addLink(tokenAddress, pair.pairAddress, "TRADES", linkWeight);
+      addLink(tokenAddress, pair.pairAddress, "TRADES", "liquidity", linkWeight);
     }
   }
 
@@ -153,14 +164,14 @@ export function buildAddressGraphData(tokenAddress: string, evidenceItems: Graph
   const lpPairAddress = lpLock?.data?.pairAddress;
   if (isAddress(lpPairAddress) && isAddress(tokenAddress)) {
     addNode(lpPairAddress, "pair", 1.15, "LP pair");
-    addLink(tokenAddress, lpPairAddress, "LP", 1.2);
+    addLink(tokenAddress, lpPairAddress, "LP", "liquidity", 1.2);
   }
 
   const honeypot = getItem(evidenceItems, "honeypot_getSimulation");
   const honeypotPairAddress = honeypot?.data?.pairAddress;
   if (isAddress(honeypotPairAddress) && isAddress(tokenAddress)) {
     addNode(honeypotPairAddress, "pair", 1.05, "Swap simulation pair");
-    addLink(tokenAddress, honeypotPairAddress, "SIM_PAIR", 1.05);
+    addLink(tokenAddress, honeypotPairAddress, "SIM_PAIR", "liquidity", 1.05);
   }
 
   const holders = getItem(evidenceItems, "holders_getTopHolders");
@@ -206,6 +217,7 @@ export function buildAddressGraphData(tokenAddress: string, evidenceItems: Graph
       candidate.address,
       tokenAddress,
       edgeLabel,
+      "holding",
       pctOfSupply !== null ? Math.min(3.5, 1 + pctOfSupply / 12) : 1.1,
       pctOfSupply === null || method === "balance_updates",
     );
