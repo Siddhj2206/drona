@@ -15,6 +15,13 @@
       "when": 1770892912939,
       "tag": "0001_supreme_sugar_man",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1771315200000,
+      "tag": "0002_solid_scan_jobs",
+      "breakpoints": true
     }
   ]
 }

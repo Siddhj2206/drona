@@ -45,7 +45,29 @@ export const scanEvents = pgTable(
   ],
 );
 
+export const scanJobs = pgTable(
+  "scan_jobs",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    scanId: uuid("scan_id")
+      .notNull()
+      .references(() => scans.id, { onDelete: "cascade" }),
+    status: text("status").notNull().default("pending"),
+    attempt: integer("attempt").notNull().default(0),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    startedAt: timestamp("started_at", { withTimezone: true }),
+    finishedAt: timestamp("finished_at", { withTimezone: true }),
+    error: text("error"),
+  },
+  (table) => [
+    index("scan_jobs_status_created_idx").on(table.status, table.createdAt),
+    index("scan_jobs_scan_id_idx").on(table.scanId),
+  ],
+);
+
 export type Scan = typeof scans.$inferSelect;
 export type NewScan = typeof scans.$inferInsert;
 export type ScanEvent = typeof scanEvents.$inferSelect;
 export type NewScanEvent = typeof scanEvents.$inferInsert;
+export type ScanJob = typeof scanJobs.$inferSelect;
+export type NewScanJob = typeof scanJobs.$inferInsert;

@@ -2,11 +2,44 @@
 
 import { FormEvent, useMemo, useState } from "react";
 import { Send } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
 };
+
+function MarkdownMessage({ content }: { content: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        p: ({ children }) => <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>,
+        ul: ({ children }) => <ul className="mb-2 list-disc pl-5 space-y-1">{children}</ul>,
+        ol: ({ children }) => <ol className="mb-2 list-decimal pl-5 space-y-1">{children}</ol>,
+        li: ({ children }) => <li>{children}</li>,
+        strong: ({ children }) => <strong className="font-semibold text-white">{children}</strong>,
+        em: ({ children }) => <em className="italic text-gray-200">{children}</em>,
+        code: ({ children, className }) => (
+          <code className={`rounded bg-black/40 px-1 py-0.5 font-mono text-[12px] text-[#00f3ff]/90 ${className ?? ""}`}>{children}</code>
+        ),
+        a: ({ children, href }) => (
+          <a
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            className="text-[#00f3ff] underline decoration-[#00f3ff]/40 underline-offset-2 hover:text-white"
+          >
+            {children}
+          </a>
+        ),
+      }}
+    >
+      {content}
+    </ReactMarkdown>
+  );
+}
 
 export function ReportChat({ scanId }: { scanId: string }) {
   const [input, setInput] = useState("");
@@ -79,7 +112,7 @@ export function ReportChat({ scanId }: { scanId: string }) {
               {message.role === "assistant" ? (
                 <p className="mb-1 font-mono text-[10px] uppercase tracking-wider text-[#00f3ff]/50">Agent_Scout</p>
               ) : null}
-              {message.content}
+              {message.role === "assistant" ? <MarkdownMessage content={message.content} /> : <p className="whitespace-pre-wrap">{message.content}</p>}
             </div>
           </div>
         ))}
