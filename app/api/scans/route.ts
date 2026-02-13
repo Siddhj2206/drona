@@ -2,8 +2,10 @@ import { NextResponse } from "next/server";
 import { and, desc, eq } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/lib/db/client";
+import { enqueueScanJob } from "@/lib/db/scan-jobs";
 import { getContractCodeStatus } from "@/lib/chains/evm/base-rpc";
 import { scans } from "@/lib/db/schema";
+import { triggerScanJobWorker } from "@/lib/scanner/scan-job-worker";
 
 export const runtime = "nodejs";
 
@@ -69,6 +71,9 @@ export async function POST(request: Request) {
     model: null,
     error: null,
   });
+
+  await enqueueScanJob(scanId);
+  void triggerScanJobWorker();
 
   return NextResponse.json({ scanId, status: "queued", cached: false }, { status: 201 });
 }

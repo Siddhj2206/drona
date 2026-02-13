@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { useRouter } from "next/navigation";
 import { AddressGraph } from "@/components/scan/address-graph";
 import { buildAddressGraphData, type GraphEvidenceItem } from "@/lib/graph/address-graph";
@@ -36,6 +36,16 @@ type StreamPlanPayload = {
   fallback?: boolean;
 };
 
+const MAX_LOGS = 240;
+
+function addLog(setter: Dispatch<SetStateAction<LogItem[]>>, item: LogItem) {
+  setter((current) => [...current, item].slice(-MAX_LOGS));
+}
+
+function wait(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function isGraphEvidenceItem(payload: unknown): payload is GraphEvidenceItem {
   if (!payload || typeof payload !== "object") {
     return false;
@@ -70,6 +80,11 @@ export function LiveProgress({ scanId, tokenAddress, initialStatus }: LiveProgre
   const [logs, setLogs] = useState<LogItem[]>([]);
   const [evidenceItems, setEvidenceItems] = useState<GraphEvidenceItem[]>([]);
   const graphData = useMemo(() => buildAddressGraphData(tokenAddress, evidenceItems), [tokenAddress, evidenceItems]);
+  const scanStatusRef = useRef<ScanStatus>(initialScanStatus);
+
+  useEffect(() => {
+    scanStatusRef.current = scanStatus;
+  }, [scanStatus]);
 
   useEffect(() => {
     if (initialScanStatus !== "queued") {
@@ -81,21 +96,123 @@ export function LiveProgress({ scanId, tokenAddress, initialStatus }: LiveProgre
     }
 
     hasStartedRunRef.current = true;
-    fetch(`/api/scans/${scanId}/run`, { method: "POST" }).catch(() => null);
+    let cancelled = false;
+
+    const triggerRun = async () => {
+      const delays = [0, 900, 1800];
+
+      for (let attempt = 0; attempt < delays.length; attempt += 1) {
+        if (cancelled) {
+          return;
+        }
+
+        if (attempt > 0) {
+          addLog(setLogs, {
+            ts: new Date().toISOString(),
+            level: "warning",
+            message: `Run trigger retry ${attempt + 1}/${delays.length}...`,
+          });
+        }
+
+        if (delays[attempt] > 0) {
+          await wait(delays[attempt]);
+          if (cancelled) {
+            return;
+          }
+        }
+
+        try {
+          const response = await fetch(`/api/scans/${scanId}/run`, {
+            method: "POST",
+            headers: {
+              "Cache-Control": "no-store",
+            },
+          });
+
+          if (!response.ok) {
+            throw new Error(`run endpoint returned ${response.status}`);
+          }
+
+          addLog(setLogs, {
+            ts: new Date().toISOString(),
+            level: "info",
+            message: "Run trigger accepted.",
+          });
+          return;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "unknown error";
+          addLog(setLogs, {
+            ts: new Date().toISOString(),
+            level: "warning",
+            message: `Run trigger failed: ${message}`,
+          });
+        }
+      }
+
+      addLog(setLogs, {
+        ts: new Date().toISOString(),
+        level: "error",
+        message: "Unable to trigger scan run automatically. Refresh or retry.",
+      });
+    };
+
+    void triggerRun();
+
+    return () => {
+      cancelled = true;
+    };
   }, [scanId, initialScanStatus]);
 
   useEffect(() => {
     let isMounted = true;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectAttempts = 0;
 
     const appendLog = (item: LogItem) => {
       if (!isMounted) return;
 
-      setLogs((current) => [...current, item].slice(-240));
+      addLog(setLogs, item);
+    };
+
+    const scheduleReconnect = () => {
+      if (!isMounted) {
+        return;
+      }
+      if (!(scanStatusRef.current === "queued" || scanStatusRef.current === "running")) {
+        return;
+      }
+
+      reconnectAttempts += 1;
+      const delay = Math.min(1000 * 2 ** Math.min(reconnectAttempts, 3), 8000);
+      appendLog({
+        ts: new Date().toISOString(),
+        level: "warning",
+        message: `Stream interrupted, reconnecting in ${Math.round(delay / 1000)}s...`,
+      });
+
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
+      reconnectTimer = setTimeout(() => {
+        if (!isMounted) {
+          return;
+        }
+        subscribe();
+      }, delay);
     };
 
     const subscribe = () => {
       const eventSource = new EventSource(`/api/scans/${scanId}/stream`);
       eventSourceRef.current = eventSource;
+
+      eventSource.addEventListener("ready", () => {
+        reconnectAttempts = 0;
+        appendLog({
+          ts: new Date().toISOString(),
+          level: "info",
+          message: "Stream connected.",
+        });
+      });
 
       const pushEvent = (event: Event) => {
         const parsed = JSON.parse((event as MessageEvent).data) as StreamEvent;
@@ -149,6 +266,10 @@ export function LiveProgress({ scanId, tokenAddress, initialStatus }: LiveProgre
         setScanStatus("complete");
         eventSource.close();
         eventSourceRef.current = null;
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
         router.refresh();
       });
 
@@ -156,6 +277,10 @@ export function LiveProgress({ scanId, tokenAddress, initialStatus }: LiveProgre
         setScanStatus("failed");
         eventSource.close();
         eventSourceRef.current = null;
+        if (reconnectTimer) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+        }
         router.refresh();
       });
 
@@ -167,19 +292,23 @@ export function LiveProgress({ scanId, tokenAddress, initialStatus }: LiveProgre
       eventSource.onerror = () => {
         eventSource.close();
         eventSourceRef.current = null;
+        scheduleReconnect();
       };
     };
 
-    if (initialScanStatus === "queued" || initialScanStatus === "running") {
+    if (scanStatus === "queued" || scanStatus === "running") {
       subscribe();
     }
 
     return () => {
       isMounted = false;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+      }
       eventSourceRef.current?.close();
       eventSourceRef.current = null;
     };
-  }, [initialScanStatus, router, scanId]);
+  }, [router, scanId, scanStatus]);
 
   useEffect(() => {
     terminalRef.current?.scrollTo({ top: terminalRef.current.scrollHeight, behavior: "smooth" });
