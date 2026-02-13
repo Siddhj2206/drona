@@ -2,13 +2,15 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { TerminalSquare } from "lucide-react";
+import { AddressGraph } from "@/components/scan/address-graph";
+import { buildAddressGraphData, type GraphEvidenceItem } from "@/lib/graph/address-graph";
 import { HudHeader } from "@/components/scan/hud-header";
 
 type ScanStatus = "queued" | "running" | "complete" | "failed" | "canceled";
 
 type LiveProgressProps = {
   scanId: string;
+  tokenAddress: string;
   initialStatus: string;
 };
 
@@ -21,13 +23,26 @@ type LogItem = {
 };
 
 type StreamEvent = {
+  id?: number;
+  type?: string;
+  stepKey?: string | null;
   ts: string;
   level: LogLevel;
   message: string;
-  payload?: {
-    fallback?: boolean;
-  };
+  payload?: unknown;
 };
+
+type StreamPlanPayload = {
+  fallback?: boolean;
+};
+
+function isGraphEvidenceItem(payload: unknown): payload is GraphEvidenceItem {
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+  const candidate = payload as Partial<GraphEvidenceItem>;
+  return typeof candidate.tool === "string" && typeof candidate.status === "string";
+}
 
 function normalizeStatus(value: string): ScanStatus {
   if (value === "queued" || value === "running" || value === "complete" || value === "failed" || value === "canceled") {
@@ -44,7 +59,7 @@ function levelClass(level: LogLevel) {
   return "text-gray-300";
 }
 
-export function LiveProgress({ scanId, initialStatus }: LiveProgressProps) {
+export function LiveProgress({ scanId, tokenAddress, initialStatus }: LiveProgressProps) {
   const router = useRouter();
   const terminalRef = useRef<HTMLDivElement | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -53,6 +68,8 @@ export function LiveProgress({ scanId, initialStatus }: LiveProgressProps) {
 
   const [scanStatus, setScanStatus] = useState<ScanStatus>(initialScanStatus);
   const [logs, setLogs] = useState<LogItem[]>([]);
+  const [evidenceItems, setEvidenceItems] = useState<GraphEvidenceItem[]>([]);
+  const graphData = useMemo(() => buildAddressGraphData(tokenAddress, evidenceItems), [tokenAddress, evidenceItems]);
 
   useEffect(() => {
     if (initialScanStatus !== "queued") {
@@ -89,11 +106,33 @@ export function LiveProgress({ scanId, initialStatus }: LiveProgressProps) {
       eventSource.addEventListener("step.completed", pushEvent);
       eventSource.addEventListener("step.failed", pushEvent);
       eventSource.addEventListener("log.line", pushEvent);
-      eventSource.addEventListener("evidence.item", pushEvent);
+      eventSource.addEventListener("evidence.item", (event) => {
+        const parsed = JSON.parse((event as MessageEvent).data) as StreamEvent;
+        appendLog({ ts: parsed.ts, message: parsed.message, level: parsed.level });
+
+        if (!isGraphEvidenceItem(parsed.payload)) {
+          return;
+        }
+
+        const evidenceItem = parsed.payload;
+        const dedupeKey = evidenceItem.id ?? `${evidenceItem.tool}-${parsed.stepKey ?? "unknown"}`;
+
+        setEvidenceItems((current) => {
+          const existingIndex = current.findIndex((item) => (item.id ?? item.tool) === dedupeKey || item.id === evidenceItem.id);
+
+          if (existingIndex === -1) {
+            return [...current, evidenceItem];
+          }
+
+          const next = [...current];
+          next[existingIndex] = evidenceItem;
+          return next;
+        });
+      });
 
       eventSource.addEventListener("artifact.plan", (event) => {
         const parsed = JSON.parse((event as MessageEvent).data) as StreamEvent;
-        const fallback = parsed.payload?.fallback ? " (fallback)" : "";
+        const fallback = (parsed.payload as StreamPlanPayload | undefined)?.fallback ? " (fallback)" : "";
         appendLog({ ts: parsed.ts, message: `Plan ready${fallback}`, level: "info" });
       });
 
@@ -185,10 +224,11 @@ export function LiveProgress({ scanId, initialStatus }: LiveProgressProps) {
             <div className="relative h-full w-full overflow-hidden rounded-lg border border-[#00f3ff]/20 bg-[#030014]/40">
               <div className="absolute inset-0 opacity-20 bg-[linear-gradient(rgba(0,243,255,0.1)_1px,transparent_1px),linear-gradient(90deg,rgba(0,243,255,0.1)_1px,transparent_1px)] bg-[length:20px_20px]" />
 
-              <div className="relative flex h-full flex-col items-center justify-center gap-5 text-[#00f3ff]/75">
-                <TerminalSquare className="h-16 w-16" />
-                <p className="font-mono text-xs uppercase tracking-[0.22em]">Graph Placeholder</p>
-                <p className="font-mono text-[11px] text-[#00f3ff]/45">Status: {scanStatus}</p>
+              <div className="relative h-full w-full">
+                <AddressGraph data={graphData} className="h-full w-full" />
+                <div className="pointer-events-none absolute top-4 left-4 rounded border border-[#00f3ff]/25 bg-[#030014]/80 px-2 py-1 font-mono text-[10px] uppercase tracking-[0.14em] text-[#00f3ff]/75">
+                  {scanStatus} :: {graphData.nodes.length} nodes / {graphData.links.length} links
+                </div>
               </div>
             </div>
           </div>

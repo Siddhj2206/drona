@@ -1,6 +1,11 @@
 const DEFAULT_BITQUERY_ENDPOINT = "https://streaming.bitquery.io/graphql";
 const DEFAULT_TIMEOUT_MS = 10_000;
 
+const FAST_PROBE_DAYS = [1, 2, 7];
+const FULL_PROBE_DAYS = [1, 2, 3, 7, 14, 30];
+
+type HoldersMode = "off" | "fast" | "full";
+
 type BitqueryHoldersResult = {
   asOfDate: string;
   attemptedDates: string[];
@@ -44,6 +49,57 @@ function withTimeout(timeoutMs: number) {
     signal: controller.signal,
     clear: () => clearTimeout(timeout),
   };
+}
+
+function parsePositiveInt(value: string | undefined, fallback: number) {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+
+  return parsed;
+}
+
+function getHoldersMode(): HoldersMode {
+  const raw = process.env.BITQUERY_HOLDERS_MODE?.toLowerCase();
+  if (raw === "off" || raw === "fast" || raw === "full") {
+    return raw;
+  }
+  return "fast";
+}
+
+function getProbeDays(mode: HoldersMode) {
+  if (mode === "full") {
+    return FULL_PROBE_DAYS;
+  }
+  if (mode === "fast") {
+    return FAST_PROBE_DAYS;
+  }
+  return [];
+}
+
+function isCreditsOrRateLimitStatus(status: number) {
+  return status === 402 || status === 429;
+}
+
+function hasQuotaError(errors: Array<{ message?: string }> | undefined) {
+  if (!Array.isArray(errors) || errors.length === 0) {
+    return false;
+  }
+
+  return errors.some((error) => {
+    const message = (error.message ?? "").toLowerCase();
+    return (
+      message.includes("credit") ||
+      message.includes("rate limit") ||
+      message.includes("too many") ||
+      message.includes("quota")
+    );
+  });
 }
 
 const TOKEN_HOLDERS_QUERY = `
@@ -94,12 +150,21 @@ export async function getTopHoldersFromBitquery(
   }
 
   const endpoint = process.env.BITQUERY_ENDPOINT ?? DEFAULT_BITQUERY_ENDPOINT;
+  const mode = getHoldersMode();
+  if (mode === "off") {
+    throw new Error("Bitquery holders lookup is disabled by BITQUERY_HOLDERS_MODE=off");
+  }
+
+  const probeDays = getProbeDays(mode);
+  const maxAttempts = parsePositiveInt(process.env.BITQUERY_MAX_ARCHIVE_ATTEMPTS, probeDays.length);
+  const minRows = parsePositiveInt(process.env.BITQUERY_MIN_HOLDER_ROWS, 3);
   const attemptedDates: string[] = [];
   const token = tokenAddress.toLowerCase();
   let lastError = "No holder data returned";
-  const minimumRows = Math.min(5, limit);
+  const minimumRows = Math.max(1, Math.min(limit, minRows));
+  let shouldRunFallback = true;
 
-  for (let daysAgo = 1; daysAgo <= 30; daysAgo += 1) {
+  for (const daysAgo of probeDays.slice(0, maxAttempts)) {
     const date = toDateDaysAgo(daysAgo);
     attemptedDates.push(date);
     const { signal, clear } = withTimeout(DEFAULT_TIMEOUT_MS);
@@ -125,6 +190,10 @@ export async function getTopHoldersFromBitquery(
 
       if (!response.ok) {
         lastError = `Bitquery request failed with ${response.status}`;
+        if (isCreditsOrRateLimitStatus(response.status)) {
+          shouldRunFallback = false;
+          break;
+        }
         continue;
       }
 
@@ -132,6 +201,10 @@ export async function getTopHoldersFromBitquery(
 
       if (Array.isArray(json.errors) && json.errors.length > 0) {
         lastError = json.errors.map((error) => error.message ?? "Unknown GraphQL error").join("; ");
+        if (hasQuotaError(json.errors)) {
+          shouldRunFallback = false;
+          break;
+        }
         continue;
       }
 
@@ -159,6 +232,10 @@ export async function getTopHoldersFromBitquery(
     } finally {
       clear();
     }
+  }
+
+  if (!shouldRunFallback) {
+    throw new Error(lastError);
   }
 
   {
@@ -220,6 +297,9 @@ export async function getTopHoldersFromBitquery(
         }
       } else {
         lastError = `Bitquery fallback request failed with ${fallbackResponse.status}`;
+        if (isCreditsOrRateLimitStatus(fallbackResponse.status)) {
+          throw new Error(lastError);
+        }
       }
     } finally {
       clear();

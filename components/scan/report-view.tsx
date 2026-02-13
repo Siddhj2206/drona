@@ -1,10 +1,13 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { AlertTriangle, ShieldCheck } from "lucide-react";
+import { ShieldCheck } from "lucide-react";
+import { Cell, Pie, PieChart, ResponsiveContainer, Sector, Tooltip } from "recharts";
+import { AddressGraph } from "@/components/scan/address-graph";
 import { HudHeader } from "@/components/scan/hud-header";
 import { TimelineSheet } from "@/components/scan/timeline-sheet";
 import { ReportChat } from "@/components/scan/report-chat";
+import { buildAddressGraphData } from "@/lib/graph/address-graph";
 
 type ScoreReason = {
   title: string;
@@ -16,6 +19,13 @@ type AgentScore = {
   overallScore: number;
   riskLevel: "low" | "medium" | "high" | "critical";
   confidence: "low" | "medium" | "high";
+  categoryScores?: {
+    contractRisk: number;
+    liquidityRisk: number;
+    behaviorRisk: number;
+    distributionRisk: number;
+    honeypotRisk: number;
+  };
   reasons: ScoreReason[];
   missingData: string[];
 };
@@ -24,6 +34,7 @@ type EvidenceItem = {
   id: string;
   tool: string;
   title: string;
+  sourceUrl?: string | null;
   status: "ok" | "unavailable";
   fetchedAt: string;
   error: string | null;
@@ -54,6 +65,17 @@ type AuditCheck = {
   status: "safe" | "warning" | "danger";
   detail: string;
   meta?: string;
+};
+
+type SectionStatus = "safe" | "warning" | "danger" | "unknown";
+
+type ScamSection = {
+  id: string;
+  title: string;
+  status: SectionStatus;
+  sourceUrl: string | null;
+  rows: Array<{ label: string; value: string }>;
+  note?: string;
 };
 
 function isAgentScore(value: unknown): value is AgentScore {
@@ -94,6 +116,10 @@ function getHolderDistribution(items: EvidenceItem[]) {
       error: holderEvidence?.error ?? null,
       top5: [] as HolderRow[],
       top5Pct: null as number | null,
+      top10Pct: null as number | null,
+      method: null as string | null,
+      amountSemantics: null as string | null,
+      supplyPctAvailable: false,
       asOfDate: null as string | null,
     };
   }
@@ -127,24 +153,71 @@ function getHolderDistribution(items: EvidenceItem[]) {
     error: holderEvidence.error,
     top5,
     top5Pct: typeof holderEvidence.data?.top5Pct === "number" ? holderEvidence.data.top5Pct : null,
+    top10Pct: typeof holderEvidence.data?.top10Pct === "number" ? holderEvidence.data.top10Pct : null,
+    method: typeof holderEvidence.data?.method === "string" ? holderEvidence.data.method : null,
+    amountSemantics: typeof holderEvidence.data?.amountSemantics === "string" ? holderEvidence.data.amountSemantics : null,
+    supplyPctAvailable: holderEvidence.data?.supplyPctAvailable === true,
     asOfDate: typeof holderEvidence.data?.asOfDate === "string" ? holderEvidence.data.asOfDate : null,
   };
+}
+
+function getDistributionCaption(holderDistribution: ReturnType<typeof getHolderDistribution>) {
+  if (!holderDistribution.available) {
+    return null;
+  }
+
+  const topWalletPct = holderDistribution.top5[0]?.pctOfSupply ?? null;
+  const top5Pct = holderDistribution.top5Pct;
+  const top10Pct = holderDistribution.top10Pct;
+  const contractCount = holderDistribution.top5.filter((holder) => holder.isContract === true).length;
+
+  if (topWalletPct !== null && topWalletPct >= 20) {
+    return "Whale-heavy pattern: a single wallet holds a large share of supply.";
+  }
+
+  if (top10Pct !== null && top10Pct >= 70) {
+    return "Concentrated holder pattern: top wallets can move price quickly on large sells.";
+  }
+
+  if (contractCount >= 3) {
+    return "Contract-heavy distribution: a notable share sits in contract wallets (pool/treasury/router).";
+  }
+
+  if (top5Pct !== null && top5Pct <= 25) {
+    return "Broad distribution: no strong concentration signal among the largest tracked wallets.";
+  }
+
+  if (top5Pct !== null && top5Pct <= 45) {
+    return "Mixed distribution: moderate concentration; monitor major wallet movements.";
+  }
+
+  if (top5Pct === null) {
+    return holderDistribution.method === "balance_updates"
+      ? "Approximate distribution: fallback mode uses USD-weighted ranking, not token supply percentages."
+      : "Approximate distribution: percentages are relative to visible holders only.";
+  }
+
+  return "Concentrated distribution: a small wallet set controls a significant share.";
 }
 
 function getIdentityFacts(items: EvidenceItem[]) {
   const dex = items.find((item) => item.tool === "dexscreener_getPairs");
   const verify = items.find((item) => item.tool === "basescan_getSourceInfo");
+  const honeypot = items.find((item) => item.tool === "honeypot_getSimulation");
 
   const bestPair = (dex?.data?.bestPair as { liquidityUsd?: number | null } | undefined) ?? undefined;
   const liquidity = typeof bestPair?.liquidityUsd === "number" ? `$${Math.round(bestPair.liquidityUsd).toLocaleString()}` : "UNKNOWN";
   const verifiedRaw = verify?.data?.isVerified;
   const verified = verifiedRaw === true ? "YES" : verifiedRaw === false ? "NO" : "UNKNOWN";
+  const sellableRaw = honeypot?.data?.sellable;
+  const honeypotResult =
+    sellableRaw === true ? "NO (SELLABLE)" : sellableRaw === false ? "YES" : honeypot?.status === "unavailable" ? "DATA_UNAVAILABLE" : "UNKNOWN";
 
   return {
     marketCap: "UNKNOWN",
     liquidity,
     verified,
-    honeypot: "UNKNOWN",
+    honeypot: honeypotResult,
   };
 }
 
@@ -155,6 +228,11 @@ function getAuditChecks(agentScore: AgentScore | null, holderDistribution: Retur
   const verify = items.find((item) => item.tool === "basescan_getSourceInfo");
   const dex = items.find((item) => item.tool === "dexscreener_getPairs");
   const holders = items.find((item) => item.tool === "holders_getTopHolders");
+  const honeypot = items.find((item) => item.tool === "honeypot_getSimulation");
+  const ownerStatus = items.find((item) => item.tool === "contract_ownerStatus");
+  const capabilityScan = items.find((item) => item.tool === "contract_capabilityScan");
+  const creation = items.find((item) => item.tool === "basescan_getContractCreation");
+  const lpLock = items.find((item) => item.tool === "lp_v2_lockStatus");
 
   const hasCode = bytecode?.data?.hasCode === true;
   const bytecodeSize = typeof bytecode?.data?.bytecodeSizeBytes === "number" ? bytecode.data.bytecodeSizeBytes : null;
@@ -238,7 +316,9 @@ function getAuditChecks(agentScore: AgentScore | null, holderDistribution: Retur
       detail:
         concentration !== null
           ? `Top 5 hold ${concentration.toFixed(2)}% of supply`
-          : "Supply-based concentration unavailable (relative share mode)",
+          : holderDistribution.method === "balance_updates"
+            ? "Supply-based concentration unavailable (USD-weighted fallback mode)"
+            : "Supply-based concentration unavailable (relative share mode)",
       meta: `Top wallets: ${nonContractCount} EOA / ${holderDistribution.top5.length - nonContractCount} contract | >=10% wallets: ${highWalletCount}`,
     });
   } else {
@@ -251,12 +331,124 @@ function getAuditChecks(agentScore: AgentScore | null, holderDistribution: Retur
     });
   }
 
+  const simulationSuccess = honeypot?.data?.simulationSuccess === true;
+  const sellable = honeypot?.data?.sellable;
+  const buyTax = typeof honeypot?.data?.buyTax === "number" ? honeypot.data.buyTax : null;
+  const sellTax = typeof honeypot?.data?.sellTax === "number" ? honeypot.data.sellTax : null;
+
   checks.push({
-    id: "sellability",
-    label: "Sellability / Honeypot",
-    status: "warning",
-    detail: "Simulation not implemented yet",
-    meta: "No on-chain sell simulation evidence available",
+    id: "swap-analysis",
+    label: "Swap Analysis (honeypot.is)",
+    status:
+      honeypot?.status === "unavailable"
+        ? "warning"
+        : simulationSuccess && sellable === true
+          ? "safe"
+          : simulationSuccess && sellable === false
+            ? "danger"
+            : "warning",
+    detail:
+      honeypot?.status === "unavailable"
+        ? "Swap simulation data unavailable"
+        : simulationSuccess && sellable === true
+          ? "Token is sellable (not a honeypot) at this time"
+          : simulationSuccess && sellable === false
+            ? "Token appears non-sellable / honeypot-like"
+            : "Simulation did not return a conclusive result",
+    meta:
+      buyTax !== null && sellTax !== null
+        ? `Buy fee: ${buyTax.toFixed(2)}% | Sell fee: ${sellTax.toFixed(2)}%`
+        : honeypot?.error ?? "Fees unavailable",
+  });
+
+  const ownerAddress = typeof ownerStatus?.data?.ownerAddress === "string" ? ownerStatus.data.ownerAddress : null;
+  const renounced = ownerStatus?.data?.renounced;
+  checks.push({
+    id: "ownership",
+    label: "Contract Ownership",
+    status: renounced === true ? "safe" : renounced === false ? "warning" : "warning",
+    detail:
+      renounced === true
+        ? "Ownership renounced"
+        : renounced === false
+          ? "Ownership not renounced; owner can potentially modify behavior"
+          : "Ownership status unavailable",
+    meta: ownerAddress ?? ownerStatus?.error ?? undefined,
+  });
+
+  const mintPossible = capabilityScan?.data?.mintPossible === true;
+  const canSetFees = capabilityScan?.data?.canSetFees === true;
+  const canPause = capabilityScan?.data?.canPause === true;
+  const canBlacklist = capabilityScan?.data?.canBlacklist === true;
+  const capabilityFlags = [
+    mintPossible ? "mint" : null,
+    canSetFees ? "fee/tax changes" : null,
+    canPause ? "pause" : null,
+    canBlacklist ? "blacklist" : null,
+  ].filter((entry): entry is string => Boolean(entry));
+
+  checks.push({
+    id: "capabilities",
+    label: "Contract Capability Scan",
+    status: capabilityFlags.length > 0 ? "danger" : "safe",
+    detail:
+      capabilityFlags.length > 0
+        ? "Admin-sensitive functions detected in ABI"
+        : "No high-risk admin functions detected in ABI",
+    meta: capabilityFlags.length > 0 ? capabilityFlags.join(", ") : undefined,
+  });
+
+  const deployerAddress = typeof creation?.data?.deployerAddress === "string" ? creation.data.deployerAddress : null;
+  const deployerHolder = deployerAddress
+    ? holderDistribution.top5.find((holder) => holder.address.toLowerCase() === deployerAddress.toLowerCase())
+    : null;
+  const ownerHolder = ownerAddress
+    ? holderDistribution.top5.find((holder) => holder.address.toLowerCase() === ownerAddress.toLowerCase())
+    : null;
+  const deployerPct = deployerHolder?.pctOfSupply ?? null;
+  const ownerPct = ownerHolder?.pctOfSupply ?? null;
+
+  checks.push({
+    id: "owner-creator-balance",
+    label: "Owner / Creator Holder Share",
+    status:
+      (typeof ownerPct === "number" && ownerPct >= 5) || (typeof deployerPct === "number" && deployerPct >= 5)
+        ? "danger"
+        : "safe",
+    detail: "Estimated share from top holders snapshot",
+    meta: `Owner: ${ownerPct !== null ? `${ownerPct.toFixed(2)}%` : "unknown"} | Creator: ${deployerPct !== null ? `${deployerPct.toFixed(2)}%` : "unknown"}`,
+  });
+
+  const top10Pct = holderDistribution.top10Pct ?? null;
+  checks.push({
+    id: "top10",
+    label: "Top 10 Holder Concentration",
+    status: top10Pct === null ? "warning" : top10Pct >= 70 ? "danger" : "safe",
+    detail:
+      top10Pct === null
+        ? "Top 10 concentration unavailable"
+        : `Top 10 holders control ${top10Pct.toFixed(2)}% of tracked supply`,
+    meta: holderDistribution.method === "balance_updates" ? "Method: USD-weighted fallback" : undefined,
+  });
+
+  const lpBurnedPct = typeof lpLock?.data?.computed === "object" && lpLock?.data?.computed
+    ? (() => {
+        const computed = lpLock.data.computed as { burnedPct?: unknown };
+        return typeof computed.burnedPct === "number" ? computed.burnedPct : null;
+      })()
+    : null;
+  const lpStatusRaw = lpLock?.data?.lockStatus;
+  checks.push({
+    id: "liquidity-lock",
+    label: "Liquidity Analysis (V2 LP)",
+    status: lpStatusRaw === "locked" ? "safe" : lpStatusRaw === "unlocked" ? "danger" : "warning",
+    detail:
+      lpStatusRaw === "locked"
+        ? "Largest V2 LP appears burned/locked"
+        : lpStatusRaw === "unlocked"
+          ? "Largest V2 LP appears withdrawable"
+          : "Largest V2 LP lock status unknown",
+    meta: lpBurnedPct !== null ? `Burned LP: ${lpBurnedPct.toFixed(2)}%` : undefined,
   });
 
   checks.push({
@@ -286,15 +478,209 @@ function getAuditChecks(agentScore: AgentScore | null, holderDistribution: Retur
   return checks;
 }
 
+function findCheck(auditChecks: AuditCheck[], id: string) {
+  return auditChecks.find((check) => check.id === id);
+}
+
+function toSectionStatus(check?: AuditCheck): SectionStatus {
+  if (!check) {
+    return "unknown";
+  }
+  return check.status;
+}
+
+function getScamSections(
+  auditChecks: AuditCheck[],
+  holderDistribution: ReturnType<typeof getHolderDistribution>,
+  items: EvidenceItem[],
+  distributionCaption: string | null,
+): ScamSection[] {
+  const honeypot = items.find((item) => item.tool === "honeypot_getSimulation");
+  const sourceInfo = items.find((item) => item.tool === "basescan_getSourceInfo");
+  const ownerStatus = items.find((item) => item.tool === "contract_ownerStatus");
+  const creation = items.find((item) => item.tool === "basescan_getContractCreation");
+  const lpLock = items.find((item) => item.tool === "lp_v2_lockStatus");
+
+  const swapCheck = findCheck(auditChecks, "swap-analysis");
+  const ownershipCheck = findCheck(auditChecks, "ownership");
+  const capabilityCheck = findCheck(auditChecks, "capabilities");
+  const holderCheck = findCheck(auditChecks, "top10");
+  const ownerCreatorCheck = findCheck(auditChecks, "owner-creator-balance");
+  const lpCheck = findCheck(auditChecks, "liquidity-lock");
+  const marketCheck = findCheck(auditChecks, "market");
+
+  const buyTax = typeof honeypot?.data?.buyTax === "number" ? honeypot.data.buyTax : null;
+  const sellTax = typeof honeypot?.data?.sellTax === "number" ? honeypot.data.sellTax : null;
+  const sellable = honeypot?.data?.sellable;
+  const simulationSuccess = honeypot?.data?.simulationSuccess === true;
+
+  const ownerAddress = typeof ownerStatus?.data?.ownerAddress === "string" ? ownerStatus.data.ownerAddress : null;
+  const renounced = ownerStatus?.data?.renounced;
+  const deployerAddress = typeof creation?.data?.deployerAddress === "string" ? creation.data.deployerAddress : null;
+
+  const top10Text = holderDistribution.top10Pct !== null ? `${holderDistribution.top10Pct.toFixed(2)}%` : "unknown";
+  const top5Text = holderDistribution.top5Pct !== null ? `${holderDistribution.top5Pct.toFixed(2)}%` : "unknown";
+
+  const lpBurnedPct =
+    typeof lpLock?.data?.computed === "object" && lpLock?.data?.computed
+      ? (() => {
+          const computed = lpLock.data.computed as { burnedPct?: unknown };
+          return typeof computed.burnedPct === "number" ? computed.burnedPct : null;
+        })()
+      : null;
+  const lpStatus = typeof lpLock?.data?.lockStatus === "string" ? lpLock.data.lockStatus : "unknown";
+
+  return [
+    {
+      id: "swap",
+      title: "Swap Analysis",
+      status: toSectionStatus(swapCheck),
+      sourceUrl: honeypot?.sourceUrl ?? null,
+      rows: [
+        { label: "Sellability", value: simulationSuccess ? (sellable === true ? "SELLABLE" : sellable === false ? "BLOCKED" : "UNKNOWN") : "UNKNOWN" },
+        { label: "Buy Fee", value: buyTax !== null ? `${buyTax.toFixed(2)}%` : "UNKNOWN" },
+        { label: "Sell Fee", value: sellTax !== null ? `${sellTax.toFixed(2)}%` : "UNKNOWN" },
+      ],
+      note: swapCheck?.detail,
+    },
+    {
+      id: "contract",
+      title: "Contract Analysis",
+      status: capabilityCheck?.status === "danger" ? "danger" : toSectionStatus(ownershipCheck),
+      sourceUrl: sourceInfo?.sourceUrl ?? null,
+      rows: [
+        {
+          label: "Verified Source",
+          value: sourceInfo?.data?.isVerified === true ? "YES" : sourceInfo?.data?.isVerified === false ? "NO" : "UNKNOWN",
+        },
+        {
+          label: "Ownership",
+          value: renounced === true ? "RENOUNCED" : renounced === false ? "NOT RENOUNCED" : "UNKNOWN",
+        },
+        {
+          label: "Owner Wallet",
+          value: ownerAddress ? `${ownerAddress.slice(0, 8)}...${ownerAddress.slice(-6)}` : "UNKNOWN",
+        },
+        {
+          label: "Admin Risk Flags",
+          value: capabilityCheck?.meta ? capabilityCheck.meta.toUpperCase() : "NONE DETECTED",
+        },
+      ],
+      note: ownershipCheck?.detail,
+    },
+    {
+      id: "holders",
+      title: "Holder Analysis",
+      status: ownerCreatorCheck?.status === "danger" || holderCheck?.status === "danger" ? "danger" : toSectionStatus(holderCheck),
+      sourceUrl: items.find((item) => item.tool === "holders_getTopHolders")?.sourceUrl ?? null,
+      rows: [
+        { label: "Creator Wallet", value: deployerAddress ? `${deployerAddress.slice(0, 8)}...${deployerAddress.slice(-6)}` : "UNKNOWN" },
+        { label: "Top 5 Concentration", value: top5Text },
+        { label: "Top 10 Concentration", value: top10Text },
+        {
+          label: "Method",
+          value:
+            holderDistribution.method === "balance_updates"
+              ? "USD-FALLBACK"
+              : holderDistribution.method === "token_holders"
+                ? "TOKEN-HOLDERS"
+                : "UNKNOWN",
+        },
+        {
+          label: "Supply Pct",
+          value: holderDistribution.supplyPctAvailable ? "AVAILABLE" : "UNAVAILABLE",
+        },
+      ],
+      note: distributionCaption ?? holderCheck?.detail,
+    },
+    {
+      id: "liquidity",
+      title: "Liquidity Analysis",
+      status: toSectionStatus(lpCheck),
+      sourceUrl: items.find((item) => item.tool === "dexscreener_getPairs")?.sourceUrl ?? null,
+      rows: [
+        {
+          label: "LP Lock Status",
+          value:
+            lpStatus === "locked"
+              ? "LOCKED/BURNED"
+              : lpStatus === "unlocked"
+                ? "UNLOCKED"
+                : "UNKNOWN",
+        },
+        { label: "Burned LP", value: lpBurnedPct !== null ? `${lpBurnedPct.toFixed(2)}%` : "UNKNOWN" },
+        { label: "Market Signal", value: marketCheck?.detail?.toUpperCase() ?? "UNKNOWN" },
+      ],
+      note: lpCheck?.detail,
+    },
+  ];
+}
+
+function getRiskCompositionData(agentScore: AgentScore | null) {
+  if (!agentScore?.categoryScores) {
+    return [] as Array<{ name: string; value: number; color: string }>;
+  }
+
+  const { contractRisk, liquidityRisk, behaviorRisk, distributionRisk, honeypotRisk } = agentScore.categoryScores;
+  return [
+    { name: "Contract", value: Math.max(0, contractRisk), color: "#ff0055" },
+    { name: "Liquidity", value: Math.max(0, liquidityRisk), color: "#ff9f43" },
+    { name: "Behavior", value: Math.max(0, behaviorRisk), color: "#bc13fe" },
+    { name: "Distribution", value: Math.max(0, distributionRisk), color: "#00f3ff" },
+    { name: "Honeypot", value: Math.max(0, honeypotRisk), color: "#00ff94" },
+  ];
+}
+
+function parseActiveSectorProps(props: unknown) {
+  if (!props || typeof props !== "object") {
+    return null;
+  }
+
+  const candidate = props as Record<string, unknown>;
+  if (
+    typeof candidate.cx !== "number" ||
+    typeof candidate.cy !== "number" ||
+    typeof candidate.innerRadius !== "number" ||
+    typeof candidate.outerRadius !== "number" ||
+    typeof candidate.startAngle !== "number" ||
+    typeof candidate.endAngle !== "number" ||
+    typeof candidate.fill !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    cx: candidate.cx,
+    cy: candidate.cy,
+    innerRadius: candidate.innerRadius,
+    outerRadius: candidate.outerRadius,
+    startAngle: candidate.startAngle,
+    endAngle: candidate.endAngle,
+    fill: candidate.fill,
+  };
+}
+
 export function ReportView({ scanId, tokenAddress, status, createdAtIso, narrative, score, evidence, error }: ReportViewProps) {
   const [hudVisible, setHudVisible] = useState(true);
   const [timelineOpen, setTimelineOpen] = useState(false);
+  const [activeRiskSlice, setActiveRiskSlice] = useState<number | null>(null);
 
   const agentScore = useMemo(() => (isAgentScore(score) ? score : null), [score]);
   const evidenceItems = useMemo(() => getEvidenceItems(evidence), [evidence]);
   const holderDistribution = useMemo(() => getHolderDistribution(evidenceItems), [evidenceItems]);
+  const distributionCaption = useMemo(() => getDistributionCaption(holderDistribution), [holderDistribution]);
   const identityFacts = useMemo(() => getIdentityFacts(evidenceItems), [evidenceItems]);
   const auditChecks = useMemo(() => getAuditChecks(agentScore, holderDistribution, evidenceItems), [agentScore, holderDistribution, evidenceItems]);
+  const scamSections = useMemo(
+    () => getScamSections(auditChecks, holderDistribution, evidenceItems, distributionCaption),
+    [auditChecks, holderDistribution, evidenceItems, distributionCaption],
+  );
+  const riskCompositionData = useMemo(() => getRiskCompositionData(agentScore), [agentScore]);
+  const addressGraphData = useMemo(() => buildAddressGraphData(tokenAddress, evidenceItems), [tokenAddress, evidenceItems]);
+  const activeRiskData =
+    activeRiskSlice !== null && activeRiskSlice >= 0 && activeRiskSlice < riskCompositionData.length
+      ? riskCompositionData[activeRiskSlice]
+      : null;
 
   const riskColor =
     agentScore?.riskLevel === "critical"
@@ -346,8 +732,8 @@ export function ReportView({ scanId, tokenAddress, status, createdAtIso, narrati
           }`}
         >
           <div className="absolute inset-0 opacity-20 bg-[linear-gradient(rgba(0,243,255,0.1)_1px,transparent_1px),linear-gradient(90deg,rgba(0,243,255,0.1)_1px,transparent_1px)] bg-[length:20px_20px]" />
-          <div className="absolute inset-0 flex items-center justify-center">
-            <p className="font-mono text-xs tracking-[0.22em] uppercase text-[#00f3ff]/70">GRAPH_PLACEHOLDER</p>
+          <div className="absolute inset-0">
+            <AddressGraph data={addressGraphData} className="h-full w-full" />
           </div>
         </div>
 
@@ -358,95 +744,196 @@ export function ReportView({ scanId, tokenAddress, status, createdAtIso, narrati
             hudVisible ? "opacity-100 scale-100" : "opacity-0 scale-95 pointer-events-none"
           }`}
         >
-          <div className="col-span-12 md:col-span-3 row-span-2 bg-[#030014]/60 backdrop-blur-md border border-[#ff0055]/30 rounded-lg p-4 clip-corner-bl tech-border-glow relative overflow-hidden">
-            <div className="absolute top-0 right-0 w-20 h-20 bg-[#ff0055]/15 blur-xl" />
-            <p className="text-xs font-mono font-bold uppercase tracking-[0.2em] text-[#ff0055] mb-3">Threat_Assessment</p>
-            <p className={`text-7xl leading-none font-bold ${riskColor}`}>{agentScore?.overallScore ?? "--"}</p>
-            <p className="mt-2 text-xs font-mono uppercase tracking-[0.2em] text-gray-200">
-              {agentScore?.riskLevel ?? "unknown"}_risk
-            </p>
-            <p className="text-[10px] font-mono uppercase tracking-[0.16em] text-[#00f3ff]/60">
-              Score: {agentScore?.overallScore ?? "--"} / Confidence: {agentScore?.confidence ?? "unknown"}
-            </p>
-          </div>
-
-          <div className="col-span-12 md:col-span-3 row-span-4 bg-[#030014]/60 backdrop-blur-md border border-[#00f3ff]/20 rounded-lg p-4 clip-notch tech-border-glow relative overflow-hidden">
-            <p className="text-xs font-mono font-bold uppercase tracking-[0.2em] text-[#00f3ff] mb-3">Target_Identity</p>
-
-            <div className="space-y-2 text-sm text-gray-300">
-              <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-[#00f3ff]/60">Address</p>
-              <p className="font-mono text-xs break-all">{tokenAddress}</p>
-
-              <div className="grid grid-cols-2 gap-2 text-xs mt-3">
-                <p className="text-gray-500">Market Cap</p>
-                <p className="text-right text-gray-200">{identityFacts.marketCap}</p>
-                <p className="text-gray-500">Liquidity</p>
-                <p className="text-right text-gray-200">{identityFacts.liquidity}</p>
-                <p className="text-gray-500">Verified</p>
-                <p className="text-right text-gray-200">{identityFacts.verified}</p>
-                <p className="text-gray-500">Honeypot</p>
-                <p className="text-right text-gray-200">{identityFacts.honeypot}</p>
-                <p className="text-gray-500">Status</p>
-                <p className="text-right text-gray-200 uppercase">{status}</p>
+          <div className="col-span-12 md:col-span-9 row-span-6 flex flex-col gap-4">
+            <div className="h-1/3 grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="h-full bg-[#030014]/60 backdrop-blur-md border border-[#ff0055]/30 rounded-lg p-4 clip-corner-bl tech-border-glow relative overflow-hidden">
+                <div className="absolute top-0 right-0 w-20 h-20 bg-[#ff0055]/15 blur-xl" />
+                <p className="text-xs font-mono font-bold uppercase tracking-[0.2em] text-[#ff0055] mb-3">Threat_Assessment</p>
+                <p className={`text-7xl leading-none font-bold ${riskColor}`}>{agentScore?.overallScore ?? "--"}</p>
+                <p className="mt-2 text-xs font-mono uppercase tracking-[0.2em] text-gray-200">
+                  {agentScore?.riskLevel ?? "unknown"}_risk
+                </p>
+                <p className="text-[10px] font-mono uppercase tracking-[0.16em] text-[#00f3ff]/60">
+                  Score: {agentScore?.overallScore ?? "--"} / Confidence: {agentScore?.confidence ?? "unknown"}
+                </p>
               </div>
 
-              <div className="mt-4 border border-[#00f3ff]/15 rounded bg-black/25 p-2 max-h-32 overflow-auto scrollbar-hide">
-                <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-[#00f3ff]/70 mb-1">Creator_Risk_History</p>
-                <p className="font-mono text-[10px] text-gray-500">NO_DATA_AVAILABLE</p>
-              </div>
-            </div>
+              <div className="h-full bg-[#030014]/60 backdrop-blur-md border border-[#00f3ff]/20 rounded-lg p-4 clip-notch tech-border-glow relative overflow-hidden">
+                <p className="text-xs font-mono font-bold uppercase tracking-[0.2em] text-[#00f3ff] mb-3">Target_Identity</p>
 
-            <p className="mt-2 font-mono text-[10px] text-gray-600">Created: {new Date(createdAtIso).toLocaleString()}</p>
-            {error ? <p className="mt-1 text-xs text-[#ff0055]">{error}</p> : null}
-          </div>
+                <div className="space-y-2 text-sm text-gray-300">
+                  <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-[#00f3ff]/60">Address</p>
+                  <p className="font-mono text-xs break-all">{tokenAddress}</p>
 
-          <div className="col-span-12 md:col-span-6 row-span-6 flex flex-col gap-4">
-            <div className="h-1/3 bg-[#030014]/60 backdrop-blur-md border border-[#00f3ff]/20 rounded-lg p-4 tech-border-glow relative overflow-hidden">
-              <p className="text-xs font-mono font-bold uppercase tracking-[0.2em] text-[#00f3ff]">AI_Forensic_Review</p>
-              <p className="mt-3 text-sm text-gray-200 leading-relaxed">
-                {forensicReview}
-                <span className="inline-block ml-1 h-4 w-2 bg-[#00f3ff]/70 animate-pulse" />
-              </p>
-            </div>
-
-            <div className="h-2/3 grid grid-cols-1 lg:grid-cols-2 gap-4">
-              <div className="bg-[#030014]/60 backdrop-blur-md border border-[#00f3ff]/20 p-4 overflow-y-auto scrollbar-hide">
-                <div className="mb-3 flex items-center gap-2">
-                  <ShieldCheck className="h-4 w-4 text-[#00f3ff]" />
-                  <p className="text-xs font-mono font-bold uppercase tracking-[0.2em] text-[#00f3ff]">Vulnerability_Scan</p>
+                  <div className="grid grid-cols-2 gap-2 text-xs mt-3">
+                    <p className="text-gray-500">Market Cap</p>
+                    <p className="text-right text-gray-200">{identityFacts.marketCap}</p>
+                    <p className="text-gray-500">Liquidity</p>
+                    <p className="text-right text-gray-200">{identityFacts.liquidity}</p>
+                    <p className="text-gray-500">Verified</p>
+                    <p className="text-right text-gray-200">{identityFacts.verified}</p>
+                    <p className="text-gray-500">Honeypot</p>
+                    <p className="text-right text-gray-200">{identityFacts.honeypot}</p>
+                    <p className="text-gray-500">Status</p>
+                    <p className="text-right text-gray-200 uppercase">{status}</p>
+                  </div>
                 </div>
 
-                <div className="grid grid-cols-1 gap-3">
-                  {auditChecks.map((check) => {
-                    const style =
-                      check.status === "danger"
-                        ? "bg-[#ff0055]/10 border-[#ff0055]/50"
-                        : check.status === "warning"
-                          ? "bg-[#bc13fe]/10 border-[#bc13fe]/50"
-                          : "bg-[#00f3ff]/5 border-[#00f3ff]/30";
+                <p className="mt-3 font-mono text-[10px] text-gray-600">Created: {new Date(createdAtIso).toLocaleString()}</p>
+                {error ? <p className="mt-1 text-xs text-[#ff0055]">{error}</p> : null}
+              </div>
+
+              <div className="h-full bg-[#030014]/60 backdrop-blur-md border border-[#00f3ff]/20 rounded-lg p-4 tech-border-glow relative overflow-hidden overflow-y-auto scrollbar-hide">
+                <p className="text-xs font-mono font-bold uppercase tracking-[0.2em] text-[#00f3ff]">AI_Forensic_Review</p>
+                <p className="mt-3 text-sm text-gray-200 leading-relaxed">
+                  {forensicReview}
+                  <span className="inline-block ml-1 h-4 w-2 bg-[#00f3ff]/70 animate-pulse" />
+                </p>
+              </div>
+            </div>
+
+            <div className="h-2/3 grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="lg:col-span-2 bg-[#030014]/60 backdrop-blur-md border border-[#00f3ff]/20 rounded-lg p-4 tech-border-glow overflow-y-auto scrollbar-hide">
+                <div className="mb-4 flex flex-col items-center gap-3">
+                  <div className="flex items-center justify-center gap-2">
+                    <ShieldCheck className="h-4 w-4 text-[#00f3ff]" />
+                    <p className="text-xs font-mono font-bold uppercase tracking-[0.2em] text-[#00f3ff]">Scam_Analysis</p>
+                  </div>
+                  <div className="relative h-56 w-56 shrink-0">
+                    {riskCompositionData.length > 0 ? (
+                      <>
+                        <ResponsiveContainer width="100%" height="100%">
+                          <PieChart>
+                            <Pie
+                              data={riskCompositionData}
+                              dataKey="value"
+                              nameKey="name"
+                              cx="50%"
+                              cy="50%"
+                              innerRadius={62}
+                              outerRadius={102}
+                              paddingAngle={2}
+                              stroke="none"
+                              activeIndex={activeRiskSlice ?? undefined}
+                              activeShape={(props: unknown) => {
+                                const sector = parseActiveSectorProps(props);
+                                if (!sector) {
+                                  return <></>;
+                                }
+
+                                return (
+                                  <Sector
+                                    cx={sector.cx}
+                                    cy={sector.cy}
+                                    innerRadius={sector.innerRadius}
+                                    outerRadius={sector.outerRadius + 10}
+                                    startAngle={sector.startAngle}
+                                    endAngle={sector.endAngle}
+                                    fill={sector.fill}
+                                  />
+                                );
+                              }}
+                              onMouseEnter={(_data, index) => setActiveRiskSlice(index)}
+                              onMouseLeave={() => setActiveRiskSlice(null)}
+                            >
+                              {riskCompositionData.map((slice) => (
+                                <Cell key={slice.name} fill={slice.color} />
+                              ))}
+                            </Pie>
+                            <Tooltip
+                              formatter={(value: number, _name: string, entry: { payload?: { name?: string } }) => {
+                                const label = entry?.payload?.name ?? "Risk";
+                                return [`${value.toFixed(1)} / 100`, label];
+                              }}
+                              contentStyle={{
+                                background: "rgba(3, 0, 20, 0.96)",
+                                border: "1px solid rgba(0, 243, 255, 0.4)",
+                                borderRadius: "8px",
+                                color: "#d1d5db",
+                                fontFamily: "JetBrains Mono, monospace",
+                                fontSize: "11px",
+                                padding: "8px 10px",
+                              }}
+                              labelStyle={{ color: "#00f3ff", fontSize: "11px", textTransform: "uppercase", letterSpacing: "0.08em" }}
+                              itemStyle={{ color: "#e5e7eb", fontSize: "11px" }}
+                            />
+                          </PieChart>
+                        </ResponsiveContainer>
+                        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+                          <div className="text-center">
+                            <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-[#00f3ff]/75">
+                              {activeRiskData ? activeRiskData.name : "Risk Mix"}
+                            </p>
+                            <p className="font-mono text-lg leading-none text-[#00f3ff]/90">
+                              {activeRiskData ? `${activeRiskData.value.toFixed(1)}` : `${agentScore?.overallScore ?? "--"}`}
+                            </p>
+                          </div>
+                        </div>
+                      </>
+                    ) : (
+                      <div className="flex h-full w-full items-center justify-center rounded-full border border-[#00f3ff]/20 text-[10px] font-mono uppercase tracking-[0.12em] text-[#00f3ff]/50">
+                        no data
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                  {scamSections.map((section) => {
+                    const sectionStyle =
+                      section.status === "danger"
+                        ? "border-[#ff0055]/45 bg-[#ff0055]/8"
+                        : section.status === "warning"
+                          ? "border-[#ff9f43]/45 bg-[#ff9f43]/8"
+                          : section.status === "safe"
+                            ? "border-[#00f3ff]/30 bg-[#00f3ff]/5"
+                            : "border-[#6b7280]/40 bg-[#6b7280]/8";
+
+                    const pillStyle =
+                      section.status === "danger"
+                        ? "text-[#ff0055] border-[#ff0055]/50"
+                        : section.status === "warning"
+                          ? "text-[#ff9f43] border-[#ff9f43]/50"
+                          : section.status === "safe"
+                            ? "text-[#00f3ff] border-[#00f3ff]/40"
+                            : "text-gray-400 border-gray-500/40";
 
                     return (
-                      <div key={check.id} className={`relative border p-3 ${style}`}>
-                        {check.status === "danger" ? <AlertTriangle className="absolute top-2 right-2 h-3 w-3 text-[#ff0055]" /> : null}
-                        <p className="text-xs font-semibold text-gray-100 uppercase tracking-[0.08em]">{check.label}</p>
-                        <p className="mt-1 text-xs leading-relaxed text-gray-200">{check.detail}</p>
-                        {check.meta ? <p className="mt-1 font-mono text-[10px] leading-relaxed tracking-[0.08em] text-gray-400">{check.meta}</p> : null}
-                        <div
-                          className={`absolute bottom-0 left-0 h-0.5 w-full ${
-                            check.status === "danger"
-                              ? "bg-[#ff0055]"
-                              : check.status === "warning"
-                                ? "bg-[#bc13fe]"
-                                : "bg-[#00f3ff]"
-                          }`}
-                        />
+                      <div key={section.id} className={`rounded-md border p-3 ${sectionStyle}`}>
+                        <div className="mb-2 flex items-start justify-between gap-2">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-gray-100">{section.title}</p>
+                          <span className={`rounded px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-[0.12em] border ${pillStyle}`}>
+                            {section.status}
+                          </span>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          {section.rows.map((row) => (
+                            <div key={row.label} className="flex items-center justify-between gap-2">
+                              <p className="text-[11px] text-gray-400">{row.label}</p>
+                              <p className="text-[11px] font-mono text-right text-gray-200">{row.value}</p>
+                            </div>
+                          ))}
+                        </div>
+
+                        {section.note ? <p className="mt-2 text-[10px] leading-relaxed text-gray-300/80">{section.note}</p> : null}
+                        {section.sourceUrl ? (
+                          <a
+                            href={section.sourceUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="mt-2 inline-block font-mono text-[10px] uppercase tracking-[0.14em] text-[#00f3ff]/60 hover:text-[#00f3ff]"
+                          >
+                            Source
+                          </a>
+                        ) : null}
                       </div>
                     );
                   })}
                 </div>
               </div>
 
-              <div className="bg-[#030014]/60 backdrop-blur-md border border-[#00f3ff]/20 rounded-lg p-4 flex flex-col">
+              <div className="lg:col-span-1 bg-[#030014]/60 backdrop-blur-md border border-[#00f3ff]/20 rounded-lg p-4 flex flex-col">
                 <div className="mb-3 flex items-center justify-between">
                   <p className="text-xs font-mono font-bold uppercase tracking-[0.2em] text-[#00f3ff]">Distribution_Matrix</p>
                   <p className="text-[10px] font-mono text-gray-500 uppercase tracking-[0.16em]">TOP 5 WALLETS</p>
@@ -488,9 +975,14 @@ export function ReportView({ scanId, tokenAddress, status, createdAtIso, narrati
                       <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-[#00f3ff]/60">
                         Top 5 concentration: {holderDistribution.top5Pct !== null ? `${holderDistribution.top5Pct.toFixed(2)}%` : "--"}
                       </p>
+                      {distributionCaption ? (
+                        <p className="text-[10px] leading-relaxed text-gray-300/80">{distributionCaption}</p>
+                      ) : null}
                       {holderDistribution.top5Pct === null ? (
                         <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-[#00f3ff]/45">
-                          * relative share among displayed holders
+                          {holderDistribution.method === "balance_updates"
+                            ? "* USD-weighted fallback (not token-supply percentages)"
+                            : "* relative share among displayed holders"}
                         </p>
                       ) : null}
                     </>

@@ -31,7 +31,7 @@ export default async function ScanReportPage({ params }: ScanReportPageProps) {
   }
 
   if (scan.status === "queued" || scan.status === "running") {
-    return <LiveProgress scanId={scan.id} initialStatus={scan.status} />;
+    return <LiveProgress scanId={scan.id} tokenAddress={scan.tokenAddress} initialStatus={scan.status} />;
   }
 
   return (

@@ -1,6 +1,6 @@
-import { and, asc, desc, eq, gt, max } from "drizzle-orm";
+import { and, asc, desc, eq, gt, max, sql } from "drizzle-orm";
 import { db } from "@/lib/db/client";
-import { scanEvents } from "@/lib/db/schema";
+import { scanEvents, scans } from "@/lib/db/schema";
 
 export type ScanEventLevel = "info" | "success" | "warning" | "error";
 
@@ -14,27 +14,31 @@ export type AppendScanEventInput = {
 };
 
 export async function appendScanEvent(input: AppendScanEventInput) {
-  const [last] = await db
-    .select({ maxSeq: max(scanEvents.seq) })
-    .from(scanEvents)
-    .where(eq(scanEvents.scanId, input.scanId));
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`select ${scans.id} from ${scans} where ${scans.id} = ${input.scanId} for update`);
 
-  const nextSeq = (last?.maxSeq ?? 0) + 1;
+    const [last] = await tx
+      .select({ maxSeq: max(scanEvents.seq) })
+      .from(scanEvents)
+      .where(eq(scanEvents.scanId, input.scanId));
 
-  const [event] = await db
-    .insert(scanEvents)
-    .values({
-      scanId: input.scanId,
-      seq: nextSeq,
-      level: input.level,
-      type: input.type,
-      stepKey: input.stepKey ?? null,
-      message: input.message,
-      payload: input.payload ?? null,
-    })
-    .returning();
+    const nextSeq = (last?.maxSeq ?? 0) + 1;
 
-  return event;
+    const [event] = await tx
+      .insert(scanEvents)
+      .values({
+        scanId: input.scanId,
+        seq: nextSeq,
+        level: input.level,
+        type: input.type,
+        stepKey: input.stepKey ?? null,
+        message: input.message,
+        payload: input.payload ?? null,
+      })
+      .returning();
+
+    return event;
+  });
 }
 
 export async function listScanEventsAfter(scanId: string, afterId: number) {

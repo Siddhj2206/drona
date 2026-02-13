@@ -10,6 +10,10 @@ export const dynamic = "force-dynamic";
 
 const TERMINAL_STATUSES = new Set(["complete", "failed", "canceled"]);
 const TERMINAL_EVENT_TYPES = new Set(["run.completed", "run.failed"]);
+const POLL_INTERVAL_MS = 1200;
+const STATUS_CHECK_EVERY_LOOPS = 4;
+const HEARTBEAT_INTERVAL_MS = 15_000;
+const SSE_RETRY_MS = 3000;
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -47,29 +51,36 @@ export async function GET(request: Request, context: { params: Promise<{ scanId:
         controller.enqueue(encoder.encode(chunk));
       };
 
+      const pushEvent = (event: Awaited<ReturnType<typeof listScanEventsAfter>>[number]) => {
+        cursor = event.id;
+        push(`id: ${event.id}\n`);
+        push(`event: ${event.type}\n`);
+        push(
+          `data: ${JSON.stringify({
+            id: event.id,
+            seq: event.seq,
+            ts: event.ts,
+            level: event.level,
+            type: event.type,
+            stepKey: event.stepKey,
+            message: event.message,
+            payload: event.payload,
+          })}\n\n`,
+        );
+      };
+
+      push(`retry: ${SSE_RETRY_MS}\n\n`);
       push(`event: ready\ndata: ${JSON.stringify({ scanId: id, cursor })}\n\n`);
       let sawTerminalEvent = false;
+      let loopCount = 0;
+      let lastHeartbeatAt = Date.now();
 
       while (!cancelled) {
+        loopCount += 1;
         const events = await listScanEventsAfter(id, cursor);
 
         for (const event of events) {
-          cursor = event.id;
-
-          push(`id: ${event.id}\n`);
-          push(`event: ${event.type}\n`);
-          push(
-            `data: ${JSON.stringify({
-              id: event.id,
-              seq: event.seq,
-              ts: event.ts,
-              level: event.level,
-              type: event.type,
-              stepKey: event.stepKey,
-              message: event.message,
-              payload: event.payload,
-            })}\n\n`,
-          );
+          pushEvent(event);
 
           if (TERMINAL_EVENT_TYPES.has(event.type)) {
             sawTerminalEvent = true;
@@ -86,38 +97,32 @@ export async function GET(request: Request, context: { params: Promise<{ scanId:
           return;
         }
 
-        const latestScan = await db.query.scans.findFirst({
-          where: eq(scans.id, id),
-        });
-
-        if (!latestScan || TERMINAL_STATUSES.has(latestScan.status)) {
-          const trailingEvents = await listScanEventsAfter(id, cursor);
-
-          for (const event of trailingEvents) {
-            cursor = event.id;
-
-            push(`id: ${event.id}\n`);
-            push(`event: ${event.type}\n`);
-            push(
-              `data: ${JSON.stringify({
-                id: event.id,
-                seq: event.seq,
-                ts: event.ts,
-                level: event.level,
-                type: event.type,
-                stepKey: event.stepKey,
-                message: event.message,
-                payload: event.payload,
-              })}\n\n`,
-            );
+        if (events.length === 0) {
+          const now = Date.now();
+          if (now - lastHeartbeatAt >= HEARTBEAT_INTERVAL_MS) {
+            push(`: heartbeat ${now}\n\n`);
+            lastHeartbeatAt = now;
           }
 
-          push("event: end\ndata: {}\n\n");
-          controller.close();
-          return;
+          if (loopCount % STATUS_CHECK_EVERY_LOOPS === 0) {
+            const latestScan = await db.query.scans.findFirst({
+              where: eq(scans.id, id),
+            });
+
+            if (!latestScan || TERMINAL_STATUSES.has(latestScan.status)) {
+              const trailingEvents = await listScanEventsAfter(id, cursor);
+              for (const event of trailingEvents) {
+                pushEvent(event);
+              }
+
+              push("event: end\ndata: {}\n\n");
+              controller.close();
+              return;
+            }
+          }
         }
 
-        await sleep(700);
+        await sleep(POLL_INTERVAL_MS);
       }
     },
     cancel() {

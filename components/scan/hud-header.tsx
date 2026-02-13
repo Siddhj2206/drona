@@ -1,6 +1,5 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
 
@@ -19,19 +18,8 @@ export function HudHeader({
   showTimelineButton = false,
   onOpenTimeline,
 }: HudHeaderProps) {
-  const [gasPrice, setGasPrice] = useState(0.14);
-  const [activeNodes, setActiveNodes] = useState(24);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setGasPrice((current) => Math.max(0.08, current + (Math.random() - 0.5) * 0.02));
-      setActiveNodes(() => 21 + Math.floor(Math.random() * 9));
-    }, 2000);
-
-    return () => clearInterval(interval);
-  }, []);
-
-  const gasText = useMemo(() => gasPrice.toFixed(3), [gasPrice]);
+  const gasText = "0.140";
+  const activeNodes = 24;
 
   return (
     <header className="pointer-events-none absolute top-0 left-0 right-0 z-50 h-16 bg-gradient-to-b from-[#030014]/90 to-transparent">
